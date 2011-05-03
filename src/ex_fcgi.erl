@@ -32,18 +32,20 @@
 -type value() :: binary().
 -type param() :: {key(), value()}.
 
+-type server() :: pid() | atom().
+
 -export_type([address/0, port_number/0,
               req_id/0, role/0, status/0, app_status/0,
-              key/0, value/0, param/0]).
+              key/0, value/0, param/0, server/0]).
 
 
--export([connect/2,
+-export([connect/3,
          begin_request/3,
          send/3,
          abort_request/2,
          end_request/2]).
 
--export([start_link/2,
+-export([start_link/3,
          init/1,
          handle_call/3,
          handle_cast/2,
@@ -56,37 +58,38 @@
                 next_id = 1 :: req_id()}).
 
 
--spec connect(address(), port_number()) -> {ok, pid()}.
+-spec connect(atom(), address(), port_number()) -> {ok, pid()}.
 %% @doc Connect to a FastCGI server.
-connect(Address, Port) ->
-  ex_fcgi_sup:start_child(Address, Port).
+connect(Name, Address, Port) ->
+  ex_fcgi_sup:start_child(Name, Address, Port).
 
--spec begin_request(pid(), role(), [param()]) -> {ok, reference()}.
+-spec begin_request(server(), role(), [param()]) -> {ok, reference()}.
 %% @doc Make a FastCGI request.
 begin_request(Server, Role, Params) ->
   gen_server:call(Server, {begin_request, Role, Params}, infinity).
 
--spec abort_request(pid(), reference()) -> ok.
+-spec abort_request(server(), reference()) -> ok.
 %% @doc Abort a FastCGI request.
 abort_request(Server, Ref) ->
   gen_server:cast(Server, {abort, Ref}).
 
--spec send(pid(), reference(), binary()) -> ok.
+-spec send(server(), reference(), binary()) -> ok.
 %% @doc Send data to a given FastCGI request standard input.
 send(Server, Ref, Data) ->
   gen_server:call(Server, {send, Ref, Data}, infinity).
 
--spec end_request(pid(), reference()) -> ok.
+-spec end_request(server(), reference()) -> ok.
 %% @doc Send EOF to a given FastCGI request standard output.
 end_request(Server, Ref) ->
   gen_server:call(Server, {end_request, Ref}, infinity).
 
 
--spec start_link(address(), port_number()) -> {ok, pid()}.
+-spec start_link(atom(), address(), port_number()) -> {ok, pid()}.
 %% @doc Start a new FastCGI client.
 %% @private
-start_link(Address, Port) ->
-  gen_server:start_link(?MODULE, {Address, Port}, [{timeout, infinity}]).
+start_link(Name, Address, Port) ->
+  gen_server:start_link({local, Name}, ?MODULE, {Address, Port},
+                        [{timeout, infinity}]).
 
 
 -spec init({address(), port_number()}) ->
