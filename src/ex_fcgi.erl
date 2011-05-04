@@ -28,8 +28,8 @@
 -type status() :: request_complete | cant_mpx_conn | overloaded | unknown_role.
 -type app_status() :: 0..((1 bsl 32) - 1).
 
--type key() :: binary().
--type value() :: binary().
+-type key() :: iodata().
+-type value() :: iodata().
 -type param() :: {key(), value()}.
 
 -type server() :: pid() | atom().

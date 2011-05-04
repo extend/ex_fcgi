@@ -119,7 +119,7 @@ encode_params(Params) ->
 %% @todo check keys
 %% @todo check length
 encode_params([{Key, Value} | Params], Acc) ->
-  NewAcc = case {byte_size(Key), byte_size(Value)} of
+  NewAcc = case {iolist_size(Key), iolist_size(Value)} of
              {KLen, VLen} when KLen =< 127, VLen =< 127 ->
                [[<<0:1, KLen:7, 0:1, VLen:7>>, Key, Value] | Acc];
              {KLen, VLen} when KLen =< 127, VLen =< (1 bsl 31) - 1 ->
