@@ -54,7 +54,9 @@
          terminate/2,
          code_change/3]).
 
--record(state, {socket :: inet:socket(),
+-record(state, {socket :: undefined | inet:socket(),
+                address :: address(),
+                port :: port_number(),
                 table :: ets:tid(),
                 next_id = 1 :: req_id()}).
 
@@ -103,31 +105,34 @@ start_link(Name, Address, Port) ->
                         [{timeout, infinity}]).
 
 
--spec init({address(), port_number()}) ->
-            {ok, #state{}} | {stop, {error, file:posix()}}.
+-spec init({address(), port_number()}) -> {ok, #state{}}.
 %% @private
 init({Address, Port}) ->
-  case gen_tcp:connect(Address, Port, [binary, {packet, fcgi}]) of
-    {ok, Socket} -> {ok, initial_state(Socket)};
-    Error = {error, _Reason} -> {stop, Error} end.
+  {ok, initial_state(Address, Port)}.
 
 -spec handle_call({begin_request, role(), [param()]}, {pid(), reference()},
                   #state{}) ->
-                   {reply, {ok, reference()}, #state{}};
+                   {reply, {ok, reference()}, #state{}} |
+                   {stop, file:posix(), {error, file:posix()}, #state{}};
                  ({send, reference(), binary()}, term(), #state{}) ->
-                   {reply, ok | {error, not_found}, #state{}};
+                   {reply, ok | {error, not_found}, #state{}} |
+                   {stop, file:posix(), {error, file:posix()}, #state{}};
                  ({end_request, reference()}, term(), #state{}) ->
-                   {reply, ok | {error, not_found}, #state{}}.
+                   {reply, ok | {error, not_found}, #state{}} |
+                   {stop, file:posix(), {error, file:posix()}, #state{}}.
 %% @private
 handle_call({begin_request, Role, Params}, {Pid, _Tag}, State) ->
-  {ReqId, NewState} = next_req_id(State),
-  send_packets([{fcgi_begin_request, ReqId, Role, keepalive},
-                {fcgi_params, ReqId, ex_fcgi_protocol:encode_params(Params)},
-                {fcgi_params, ReqId, <<>>}],
-               NewState),
-  Ref = erlang:monitor(process, Pid),
-  insert({ReqId, Ref, Pid}, NewState),
-  {reply, {ok, Ref}, NewState};
+  {ReqId, State1} = next_req_id(State),
+  case send_packets([{fcgi_begin_request, ReqId, Role, keepalive},
+                     {fcgi_params, ReqId,
+                      ex_fcgi_protocol:encode_params(Params)},
+                     {fcgi_params, ReqId, <<>>}], State1) of
+    {ok, State2} ->
+      Ref = erlang:monitor(process, Pid),
+      insert({ReqId, Ref, Pid}, State2),
+      {reply, {ok, Ref}, State2};
+    Error = {error, Reason} ->
+      {stop, Reason, Error, State1} end;
 handle_call({send, Ref, Data}, _From, State) when byte_size(Data) =/= 0 ->
   handle_send(Ref, Data, State);
 handle_call({end_request, Ref}, _From, State) ->
@@ -146,7 +151,7 @@ handle_cast({abort_request, Ref}, State) ->
                  ({'EXIT', reference(), process, pid(), term()}, #state{}) ->
                    {noreply, #state{}};
                  ({tcp_closed, inet:socket()}, #state{}) ->
-                   {stop, closed, #state{}}.
+                   {noreply, #state{socket :: undefined}}.
 %% @private
 handle_info({tcp, Socket, Data}, State = #state{socket = Socket}) ->
   % lookup before decode?
@@ -159,7 +164,7 @@ handle_info({'EXIT', Ref, process, _Pid, _Reason}, State) ->
   do_abort(Ref, State),
   {noreply, State};
 handle_info({tcp_closed, Socket}, State = #state{socket = Socket}) ->
-  {stop, closed, State};
+  {noreply, State#state{socket = undefined}};
 handle_info(_Info, State) ->
   {noreply, State}.
 
@@ -175,12 +180,16 @@ code_change(_OldVsn, State, _Extra) ->
 
 
 -spec handle_send(reference(), binary(), #state{}) ->
-                       {reply, ok | {error, not_found}, #state{}}.
+                   {reply, ok | {error, not_found}, #state{}} |
+                   {stop, file:posix(), {error, file:posix()}, #state{}}.
 handle_send(Ref, Data, State) ->
   case lookup(Ref, State) of
     [{Ref, ReqId}] ->
-      send({fcgi_stdin, ReqId, Data}, State),
-      {reply, ok, State};
+      case send({fcgi_stdin, ReqId, Data}, State) of
+        {ok, NewState} ->
+          {reply, ok, NewState};
+        Error = {error, Reason} ->
+          {stop, Reason, Error, State} end;
     [] -> {reply, {error, not_found}, State} end.
 
 -spec send_packet_msg(ex_fcgi_protocol:packet(),
@@ -214,21 +223,46 @@ do_abort(Ref, State) ->
     not_found -> ok end.
 
 
--spec initial_state(inet:socket()) -> #state{}.
-initial_state(Socket) ->
-  #state{socket = Socket, table = ets:new(?MODULE, [private])}.
+-spec initial_state(address(), port_number()) -> #state{}.
+initial_state(Address, Port) ->
+  #state{address = Address, port = Port, table = ets:new(?MODULE, [private])}.
 
 -spec next_req_id(#state{}) -> {req_id(), #state{}}.
 next_req_id(State = #state{next_id = ReqId}) ->
   {ReqId, State#state{next_id = ReqId + 1 rem 65535}}.
 
--spec send_packets([ex_fcgi_protocol:packet()], #state{}) -> ok.
-send_packets(Packets, #state{socket = Socket}) ->
-  gen_tcp:send(Socket, [ ex_fcgi_protocol:encode(P) || P <- Packets ]).
+-spec send_packets([ex_fcgi_protocol:packet()], #state{}) ->
+                    {ok, #state{socket :: inet:socket()}} |
+                    {error, file:posix()}.
+send_packets(Packets, State = #state{socket = undefined}) ->
+  case open_socket(State) of
+    {ok, NewState} -> send_packets(Packets, NewState);
+    Error -> Error end;
+send_packets(Packets, State = #state{socket = Socket}) ->
+  case gen_tcp:send(Socket, [ ex_fcgi_protocol:encode(P) || P <- Packets ]) of
+    ok -> {ok, State};
+    Error -> Error end.
 
--spec send(ex_fcgi_protocol:packet(), #state{}) -> ok.
-send(Packet, #state{socket = Socket}) ->
-  gen_tcp:send(Socket, ex_fcgi_protocol:encode(Packet)).
+-spec send(ex_fcgi_protocol:packet(), #state{}) ->
+            {ok, #state{socket :: inet:socket()}} | {error, file:posix()}.
+send(Packet, State = #state{socket = undefined}) ->
+  case open_socket(State) of
+    {ok, NewState} -> send(Packet, NewState);
+    Error -> Error end;
+send(Packet, State = #state{socket = Socket}) ->
+  case gen_tcp:send(Socket, ex_fcgi_protocol:encode(Packet)) of
+    ok -> {ok, State};
+    Error -> Error end.
+
+-spec open_socket(#state{socket :: undefined}) ->
+                   {ok, #state{socket :: inet:socket()}} |
+                   {error, file:posix()}.
+open_socket(State = #state{socket = undefined,
+                           address = Address,
+                           port = Port}) ->
+  case gen_tcp:connect(Address, Port, [binary, {packet, fcgi}]) of
+    {ok, Socket} -> {ok, State#state{socket = Socket}};
+    Error -> Error end.
 
 -spec insert({req_id(), reference(), pid()}, #state{}) -> true.
 insert(Req = {ReqId, Ref, _Pid}, #state{table = Tid}) ->
