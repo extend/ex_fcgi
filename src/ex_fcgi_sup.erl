@@ -19,23 +19,16 @@
 -author('Anthony Ramine <nox@dev.extend.eu>').
 -behaviour(supervisor).
 
+
 -export([start_link/0,
-         start_child/3]).
+         init/1]).
 
--export([init/1]).
-
--define(CHILD(M), {M, {M, start_link, []}, permanent, 5000, worker, [M]}).
 
 -spec start_link() -> {ok, pid()}.
 start_link() ->
   supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
--spec start_child(atom(), ex_fcgi:address(),
-                  ex_fcgi:port_number()) -> {ok, pid()}.
-start_child(Name, Address, Port) ->
-  supervisor:start_child(?MODULE, [Name, Address, Port]).
 
-
--spec init([]) -> {ok, {{simple_one_for_one, 5, 10}, [?CHILD(ex_fcgi)]}}.
+-spec init([]) -> {ok, {{one_for_one, 5, 10}, []}}.
 init([]) ->
-  {ok, {{simple_one_for_one, 5, 10}, [?CHILD(ex_fcgi)]}}.
+  {ok, {{one_for_one, 5, 10}, []}}.
