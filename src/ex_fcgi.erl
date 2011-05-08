@@ -47,9 +47,14 @@
          end_request/2]).
 
 -export([start_link/3,
-         init/3]).
+         init/4,
+         system_continue/3,
+         system_terminate/4,
+         system_code_change/4,
+         format_status/2]).
 
--record(state, {socket :: undefined | inet:socket(),
+-record(state, {parent :: pid(),
+                socket :: undefined | inet:socket(),
                 address :: address(),
                 port :: port_number(),
                 requests :: ets:tid(),
@@ -103,19 +108,47 @@ end_request(Server, Ref) ->
 %% @doc Start a new FastCGI client.
 %% @private
 start_link(Name, Address, Port) ->
-  Pid = proc_lib:spawn_link(?MODULE, init, [Name, Address, Port]),
+  Pid = proc_lib:spawn_link(?MODULE, init, [Name, self(), Address, Port]),
   {ok, Pid}.
 
 
--spec init(atom(), address(), port_number()) -> no_return().
-init(Name, Address, Port) ->
-  State = initial_state(Address, Port),
+-spec init(atom(), pid(), address(), port_number()) -> no_return().
+%% @private
+init(Name, Parent, Address, Port) ->
+  State = initial_state(Parent, Address, Port),
   register(Name, self()),
   receive_loop(State).
 
 -spec receive_loop(#state{}) -> no_return().
 receive_loop(State) ->
   receive Msg -> receive_loop(handle_msg(Msg, State)) end.
+
+-spec system_continue(pid(), term(), #state{}) -> no_return().
+system_continue(Parent, _Debug, State) ->
+  receive_loop(State#state{parent = Parent}).
+
+-spec system_terminate(term(), pid(), [], #state{}) -> no_return().
+%% @private
+system_terminate(Reason, _Parent, _Debug, _State) ->
+  exit(Reason).
+
+-spec system_code_change(#state{}, module(), term(), term()) -> {ok, #state{}}.
+%% @private
+system_code_change(State, _Module, _OldVsn, _Extra) ->
+  {ok, State}.
+
+-spec format_status(atom(), [term()]) -> term().
+format_status(_Opt, [_PDict, _SysState, Parent, _Debug,
+                     #state{socket = Socket, address = Address, port = Port,
+                            monitors = Monitors, next_id = NextId}]) ->
+  Connected = case Socket of
+                undefined -> false;
+                _ -> true end,
+  [{data, [{"State", [{connected, Connected},
+                      {address, Address},
+                      {port, Port},
+                      {next_id, NextId},
+                      {current_reqs_count, ets:info(Monitors, size)}]}]}].
 
 -spec handle_msg(term(), #state{}) -> #state{}.
 handle_msg({ex_fcgi_begin_request, Ref, Timer, Pid, Role, Params}, State) ->
@@ -158,6 +191,8 @@ handle_msg({'EXIT', MonitorRef, process, _Pid, _Reason}, State) ->
     [] -> State end;
 handle_msg({tcp_closed, Socket}, State = #state{socket = Socket}) ->
   State#state{socket = undefined};
+handle_msg({system, From, Msg}, State = #state{parent = Parent}) ->
+  sys:handle_system_msg(Msg, From, Parent, ?MODULE, [], State);
 handle_msg(_Msg, State) ->
   State.
 
@@ -203,9 +238,9 @@ do_abort(ReqId, State) ->
   send({fcgi_abort_request, ReqId}, State).
 
 
--spec initial_state(address(), port_number()) -> #state{}.
-initial_state(Address, Port) ->
-  #state{address = Address, port = Port,
+-spec initial_state(pid(), address(), port_number()) -> #state{}.
+initial_state(Parent, Address, Port) ->
+  #state{parent = Parent, address = Address, port = Port,
          requests = ets:new(requests, [private]),
          monitors = ets:new(monitors, [private])}.
 
