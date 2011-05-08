@@ -124,6 +124,7 @@ receive_loop(State) ->
   receive Msg -> receive_loop(handle_msg(Msg, State)) end.
 
 -spec system_continue(pid(), term(), #state{}) -> no_return().
+%% @private
 system_continue(Parent, _Debug, State) ->
   receive_loop(State#state{parent = Parent}).
 
@@ -138,6 +139,7 @@ system_code_change(State, _Module, _OldVsn, _Extra) ->
   {ok, State}.
 
 -spec format_status(atom(), [term()]) -> term().
+%% @private
 format_status(_Opt, [_PDict, _SysState, Parent, _Debug,
                      #state{socket = Socket, address = Address, port = Port,
                             monitors = Monitors, next_id = NextId}]) ->
