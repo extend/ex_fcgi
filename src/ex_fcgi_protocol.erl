@@ -49,11 +49,15 @@
 req_id(Packet) ->
   element(2, Packet).
 
--spec decode(binary()) -> packet().
+-spec decode(binary()) -> {packet(), binary()} | more.
 %% @doc Decode a FastCGI packet.
-decode(<<1, Type, ReqId:16, ContentLength:16, _PaddingLength, _Reserved,
-         Content:ContentLength/binary>>) ->
-  decode(Content, Type, ReqId).
+decode(Buffer) ->
+  case erlang:decode_packet(fcgi, Buffer, []) of
+    {ok, <<1, Type, ReqId:16, ContentLength:16, _PaddingLength, _Reserved,
+           Content:ContentLength/binary>>, Rest} ->
+      {decode(Content, Type, ReqId), Rest};
+    {more, _More} ->
+      more end.
 
 -spec decode(binary(), packet_type(), ex_fcgi:req_id()) -> packet().
 decode(<<RoleInt:16, Flags, _Reserved:40>>, ?FCGI_BEGIN_REQUEST, ReqId) ->

@@ -27,12 +27,19 @@
 -type role() :: responder | authorizer | filter.
 -type status() :: request_complete | cant_mpx_conn | overloaded | unknown_role.
 -type app_status() :: 0..((1 bsl 32) - 1).
+-type message() :: {end_request, status(), app_status()}
+                 | {stdout, binary()}
+                 | {stderr, binary()}
+                 | {data, binary()}.
 
 -type key() :: iodata().
 -type value() :: iodata().
 -type param() :: {key(), value()}.
 
 -type server() :: pid() | atom().
+
+-type req() :: {req_id(), Ref::reference(), Timer::reference(), pid(),
+                MonitorRef::reference()}.
 
 -export_type([address/0, port_number/0,
               req_id/0, role/0, status/0, app_status/0,
@@ -59,7 +66,8 @@
                 port :: port_number(),
                 requests :: ets:tid(),
                 monitors :: ets:tid(),
-                next_id = 1 :: req_id()}).
+                next_id = 1 :: req_id(),
+                buffer = <<>> :: binary()}).
 
 
 -spec connect(atom(), address(), port_number()) -> {ok, pid()}.
@@ -81,7 +89,7 @@ disconnect(Server) ->
 %% @doc Make a FastCGI request.
 begin_request(Server, Role, Params, Timeout) ->
   Ref = make_ref(),
-  Timer = erlang:send_after(Timeout, self(), {fcgi_timeout, Ref}),
+  Timer = erlang:send_after(Timeout, self(), {ex_fcgi_timeout, Ref}),
   Server ! {ex_fcgi_begin_request, Ref, Timer, self(), Role, Params},
   {ok, Ref}.
 
@@ -177,11 +185,9 @@ handle_msg({ex_fcgi_abort_request, Ref}, State) ->
       delete(ReqId, State),
       do_abort(ReqId, State);
     [] -> State end;
-handle_msg({tcp, Socket, Data}, State = #state{socket = Socket}) ->
-  Packet = ex_fcgi_protocol:decode(Data),
-  case lookup(ex_fcgi_protocol:req_id(Packet), State) of
-    [] -> State;
-    [Req] -> send_packet_msg(Packet, Req, State) end;
+handle_msg({tcp, Socket, Data},
+           State = #state{socket = Socket, buffer = Buffer}) ->
+  State#state{buffer = handle_data(<<Buffer/binary, Data/binary>>, State)};
 handle_msg({'EXIT', MonitorRef, process, _Pid, _Reason}, State) ->
   case lookup_monitor(MonitorRef, State) of
     [{_MonitorRef, Ref}] ->
@@ -204,30 +210,63 @@ handle_send(Ref, Data, State) ->
     [{Ref, ReqId}] -> send({fcgi_stdin, ReqId, Data}, State);
     [] -> State end.
 
--spec send_packet_msg(ex_fcgi_protocol:packet(),
-                      {req_id(), Ref::reference(), Timer::reference(), pid(),
-                       MonitorRef::reference()}, #state{}) -> #state{}.
-send_packet_msg({fcgi_end_request, ReqId, Status, AppStatus},
-                {_ReqId, Ref, Timer, Pid, MonitorRef}, State) ->
-  Pid ! {fcgi_end_request, Ref, Status, AppStatus},
+-spec handle_data(binary(), #state{}) -> binary().
+handle_data(Data, State) ->
+  case ex_fcgi_protocol:decode(Data) of
+    {Packet, Rest} ->
+      case lookup(ex_fcgi_protocol:req_id(Packet), State) of
+        [Req] -> handle_data(Rest, State, Req, [], Packet);
+        [] -> handle_data(Rest, State) end;
+    more -> Data end.
+
+-spec handle_data(binary(), #state{}, req(), [message()],
+                  ex_fcgi_protocol:packet()) -> binary().
+handle_data(Rest, State, {ReqId, Ref, Timer, Pid, MonitorRef}, Acc,
+            {fcgi_end_request, ReqId, Status, AppStatus}) ->
+  Messages = lists:reverse(Acc, [{end_request, Status, AppStatus}]),
+  Pid ! {ex_fcgi, Ref, Messages},
   _ = erlang:cancel_timer(Timer),
   erlang:demonitor(MonitorRef),
   delete_monitor(MonitorRef, State),
   delete(Ref, State),
   delete(ReqId, State),
-  State;
-send_packet_msg({fcgi_stdout, _ReqId, Data},
-                {_ReqId, Ref, _Timer, Pid, _MonitorRef}, State) ->
-  Pid ! {fcgi_stdout, Ref, stream_body(Data)},
-  State;
-send_packet_msg({fcgi_stderr, _ReqId, Data},
-                {_ReqId, Ref, _Timer, Pid, _MonitorRef}, State) ->
-  Pid ! {fcgi_stderr, Ref, stream_body(Data)},
-  State;
-send_packet_msg({fcgi_data, _ReqId, Data},
-                {_ReqId, Ref, _Timer, Pid, _MonitorRef}, State) ->
-  Pid ! {fcgi_data, Ref, stream_body(Data)},
-  State.
+  handle_data(Rest, State);
+handle_data(Rest, State, Req = {ReqId, _Ref, _Timer, _Pid, _MonitorRef}, Acc,
+            {fcgi_stdout, ReqId, Data}) ->
+  handle_data(Rest, State, Req, [{stdout, stream_body(Data)} | Acc]);
+handle_data(Rest, State, Req = {ReqId, _Ref, _Timer, _Pid, _MonitorRef}, Acc,
+            {fcgi_stderr, ReqId, Data}) ->
+  handle_data(Rest, State, Req, [{stderr, stream_body(Data)} | Acc]);
+handle_data(Rest, State, Req = {ReqId, _Ref, _Timer, _Pid, _MonitorRef}, Acc,
+            {fcgi_data, ReqId, Data}) ->
+  handle_data(Rest, State, Req, [{data, stream_body(Data)} | Acc]);
+handle_data(Rest, State, Req, Acc, Packet) ->
+  handle_data2(Rest, State, Req, Acc, Packet).
+
+-spec handle_data(binary(), #state{}, req(), [message()]) -> binary().
+handle_data(Rest, State, Req = {_ReqId, Ref, _Timer, Pid, _MonitorRef}, Acc) ->
+  case ex_fcgi_protocol:decode(Rest) of
+    {Packet, NewRest} -> handle_data(NewRest, State, Req, Acc, Packet);
+    more ->
+      Pid ! {ex_fcgi, Ref, lists:reverse(Acc)},
+      Rest end.
+
+-spec handle_data2(binary(), #state{}, req(), [message()],
+                   ex_fcgi_protocol:packet()) -> binary().
+handle_data2(Rest, State, Req = {_ReqId, Ref, _Timer, Pid, _MonitorRef},
+             Acc, Packet) ->
+  case lookup(ex_fcgi_protocol:req_id(Packet), State) of
+    [Req] -> handle_data(Rest, State, Req, Acc, Packet);
+    [NewReq] ->
+      Pid ! {ex_fcgi, Ref, lists:reverse(Acc)},
+      handle_data(Rest, State, NewReq, [], Packet);
+    [] ->
+      case ex_fcgi_protocol:decode(Rest) of
+        {NewPacket, NewRest} ->
+          handle_data2(NewRest, State, Req, Acc, NewPacket);
+        more ->
+          Pid ! {ex_fcgi, Ref, lists:reverse(Acc)},
+          Rest end end.
 
 -spec stream_body(binary()) -> binary() | eof.
 stream_body(<<>>) ->
@@ -270,7 +309,7 @@ send(Packet, State = #state{socket = Socket}) ->
 open_socket(State = #state{socket = undefined,
                            address = Address,
                            port = Port}) ->
-  {ok, Socket} = gen_tcp:connect(Address, Port, [binary, {packet, fcgi}]),
+  {ok, Socket} = gen_tcp:connect(Address, Port, [binary]),
   State#state{socket = Socket}.
 
 -spec insert({req_id(), Ref::reference(), Timer::reference(), pid(),
@@ -281,9 +320,7 @@ insert(Req = {ReqId, Ref, _Timer, _Pid, MonitorRef},
   true = ets:insert_new(Monitors, [{MonitorRef, Ref}]).
 
 -spec lookup(reference(), #state{}) -> [{reference(), req_id()}];
-            (req_id(), #state{}) ->
-              [{req_id(), Ref::reference(), Timer::reference(), pid(),
-               MonitorRef::reference()}].
+            (req_id(), #state{}) -> [req()].
 lookup(Key, #state{requests = Requests}) ->
   ets:lookup(Requests, Key).
 
