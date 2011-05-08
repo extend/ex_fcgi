@@ -198,6 +198,7 @@ handle_msg({system, From, Msg}, State = #state{parent = Parent}) ->
 handle_msg(_Msg, State) ->
   State.
 
+-spec handle_send(reference(), binary(), #state{}) -> #state{}.
 handle_send(Ref, Data, State) ->
   case lookup(Ref, State) of
     [{Ref, ReqId}] -> send({fcgi_stdin, ReqId, Data}, State);
