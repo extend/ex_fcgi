@@ -92,7 +92,7 @@ send(Server, Ref, Data) ->
   gen_server:call(Server, {send, Ref, Data}, infinity).
 
 -spec end_request(server(), reference()) -> ok.
-%% @doc Send EOF to a given FastCGI request standard output.
+%% @doc Send EOF to a given FastCGI request standard input.
 end_request(Server, Ref) ->
   gen_server:call(Server, {end_request, Ref}, infinity).
 
