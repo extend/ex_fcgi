@@ -15,10 +15,10 @@
 
 -module(ex_fcgi).
 -author('Anthony Ramine <nox@dev.extend.eu>').
--behaviour(gen_server).
 
 
 -type short() :: 0..65535.
+-type uint32() :: 0..(1 bsl 32 - 1).
 
 -type address() :: string() | atom() | inet:ip_address().
 -type port_number() :: short().
@@ -41,23 +41,19 @@
 
 -export([connect/3,
          disconnect/1,
-         begin_request/3,
+         begin_request/4,
          send/3,
          abort_request/2,
          end_request/2]).
 
 -export([start_link/3,
-         init/1,
-         handle_call/3,
-         handle_cast/2,
-         handle_info/2,
-         terminate/2,
-         code_change/3]).
+         init/3]).
 
 -record(state, {socket :: undefined | inet:socket(),
                 address :: address(),
                 port :: port_number(),
-                table :: ets:tid(),
+                requests :: ets:tid(),
+                monitors :: ets:tid(),
                 next_id = 1 :: req_id()}).
 
 
@@ -76,138 +72,124 @@ disconnect(Server) ->
     ok -> supervisor:delete_child(ex_fcgi_sup, Server);
     Error -> Error end.
 
--spec begin_request(server(), role(), [param()]) -> {ok, reference()}.
+-spec begin_request(server(), role(), [param()], uint32()) -> {ok, reference()}.
 %% @doc Make a FastCGI request.
-begin_request(Server, Role, Params) ->
-  gen_server:call(Server, {begin_request, Role, Params}, infinity).
+begin_request(Server, Role, Params, Timeout) ->
+  Ref = make_ref(),
+  Timer = erlang:send_after(Timeout, self(), {fcgi_timeout, Ref}),
+  Server ! {ex_fcgi_begin_request, Ref, Timer, self(), Role, Params},
+  {ok, Ref}.
 
 -spec abort_request(server(), reference()) -> ok.
 %% @doc Abort a FastCGI request.
 abort_request(Server, Ref) ->
-  gen_server:cast(Server, {abort, Ref}).
+  Server ! {ex_fcgi_abort_request, Ref},
+  ok.
 
 -spec send(server(), reference(), binary()) -> ok.
 %% @doc Send data to a given FastCGI request standard input.
 send(Server, Ref, Data) ->
-  gen_server:call(Server, {send, Ref, Data}, infinity).
+  Server ! {ex_fcgi_send, Ref, Data},
+  ok.
 
 -spec end_request(server(), reference()) -> ok.
 %% @doc Send EOF to a given FastCGI request standard input.
 end_request(Server, Ref) ->
-  gen_server:call(Server, {end_request, Ref}, infinity).
+  Server ! {ex_fcgi_end_request, Ref},
+  ok.
 
 
 -spec start_link(atom(), address(), port_number()) -> {ok, pid()}.
 %% @doc Start a new FastCGI client.
 %% @private
 start_link(Name, Address, Port) ->
-  gen_server:start_link({local, Name}, ?MODULE, {Address, Port},
-                        [{timeout, infinity}]).
+  Pid = proc_lib:spawn_link(?MODULE, init, [Name, Address, Port]),
+  {ok, Pid}.
 
 
--spec init({address(), port_number()}) -> {ok, #state{}}.
-%% @private
-init({Address, Port}) ->
-  {ok, initial_state(Address, Port)}.
+-spec init(atom(), address(), port_number()) -> no_return().
+init(Name, Address, Port) ->
+  State = initial_state(Address, Port),
+  register(Name, self()),
+  receive_loop(State).
 
--spec handle_call({begin_request, role(), [param()]}, {pid(), reference()},
-                  #state{}) ->
-                   {reply, {ok, reference()}, #state{}} |
-                   {stop, file:posix(), {error, file:posix()}, #state{}};
-                 ({send, reference(), binary()}, term(), #state{}) ->
-                   {reply, ok | {error, not_found}, #state{}} |
-                   {stop, file:posix(), {error, file:posix()}, #state{}};
-                 ({end_request, reference()}, term(), #state{}) ->
-                   {reply, ok | {error, not_found}, #state{}} |
-                   {stop, file:posix(), {error, file:posix()}, #state{}}.
-%% @private
-handle_call({begin_request, Role, Params}, {Pid, _Tag}, State) ->
+-spec receive_loop(#state{}) -> no_return().
+receive_loop(State) ->
+  receive Msg -> receive_loop(handle_msg(Msg, State)) end.
+
+-spec handle_msg(term(), #state{}) -> #state{}.
+handle_msg({ex_fcgi_begin_request, Ref, Timer, Pid, Role, Params}, State) ->
   {ReqId, State1} = next_req_id(State),
-  case send_packets([{fcgi_begin_request, ReqId, Role, keepalive},
-                     {fcgi_params, ReqId,
-                      ex_fcgi_protocol:encode_params(Params)},
-                     {fcgi_params, ReqId, <<>>}], State1) of
-    {ok, State2} ->
-      Ref = erlang:monitor(process, Pid),
-      insert({ReqId, Ref, Pid}, State2),
-      {reply, {ok, Ref}, State2};
-    Error = {error, Reason} ->
-      {stop, Reason, Error, State1} end;
-handle_call({send, Ref, Data}, _From, State) when byte_size(Data) =/= 0 ->
+  State2 = send_packets([{fcgi_begin_request, ReqId, Role, keepalive},
+                         {fcgi_params, ReqId,
+                          ex_fcgi_protocol:encode_params(Params)},
+                         {fcgi_params, ReqId, <<>>}], State1),
+  MonitorRef = erlang:monitor(process, Pid),
+  insert({ReqId, Ref, Timer, Pid, MonitorRef}, State2),
+  State2;
+handle_msg({ex_fcgi_send, Ref, Data}, State) ->
   handle_send(Ref, Data, State);
-handle_call({end_request, Ref}, _From, State) ->
-  handle_send(Ref, <<>>, State).
-
--spec handle_cast({abort_request, reference()}, #state{}) ->
-                   {noreply, #state{}}.
-%% @private
-handle_cast({abort_request, Ref}, State) ->
-  erlang:demonitor(Ref),
-  do_abort(Ref, State),
-  {noreply, State}.
-
--spec handle_info({tcp, inet:socket(), binary()}, #state{}) ->
-                   {noreply, #state{}};
-                 ({'EXIT', reference(), process, pid(), term()}, #state{}) ->
-                   {noreply, #state{}};
-                 ({tcp_closed, inet:socket()}, #state{}) ->
-                   {noreply, #state{socket :: undefined}}.
-%% @private
-handle_info({tcp, Socket, Data}, State = #state{socket = Socket}) ->
-  % lookup before decode?
+handle_msg({ex_fcgi_end_request, Ref}, State) ->
+  handle_send(Ref, <<>>, State);
+handle_msg({ex_fcgi_abort_request, Ref}, State) ->
+  case lookup(Ref, State) of
+    [{_Ref, ReqId}] ->
+      [{_ReqId, _Ref, Timer, _Pid, MonitorRef}] = lookup(ReqId, State),
+      _ = erlang:cancel_timer(Timer),
+      erlang:demonitor(MonitorRef),
+      delete_monitor(MonitorRef, State),
+      delete(Ref, State),
+      delete(ReqId, State),
+      do_abort(ReqId, State);
+    [] -> State end;
+handle_msg({tcp, Socket, Data}, State = #state{socket = Socket}) ->
   Packet = ex_fcgi_protocol:decode(Data),
   case lookup(ex_fcgi_protocol:req_id(Packet), State) of
-    [] -> ok;
-    [{_ReqId, Ref, Pid}] -> send_packet_msg(Packet, Ref, Pid, State) end,
-  {noreply, State};
-handle_info({'EXIT', Ref, process, _Pid, _Reason}, State) ->
-  do_abort(Ref, State),
-  {noreply, State};
-handle_info({tcp_closed, Socket}, State = #state{socket = Socket}) ->
-  {noreply, State#state{socket = undefined}};
-handle_info(_Info, State) ->
-  {noreply, State}.
+    [] -> State;
+    [Req] -> send_packet_msg(Packet, Req, State) end;
+handle_msg({'EXIT', MonitorRef, process, _Pid, _Reason}, State) ->
+  case lookup_monitor(MonitorRef, State) of
+    [{_MonitorRef, Ref}] ->
+      delete_monitor(MonitorRef, State),
+      [{_Ref, ReqId}] = lookup(Ref, State),
+      delete(Ref, State),
+      delete(ReqId, State),
+      do_abort(ReqId, State);
+    [] -> State end;
+handle_msg({tcp_closed, Socket}, State = #state{socket = Socket}) ->
+  State#state{socket = undefined};
+handle_msg(_Msg, State) ->
+  State.
 
--spec terminate(term(), #state{}) -> ok.
-%% @private
-terminate(_Reason, _State) ->
-  ok.
-
--spec code_change(term(), #state{}, term()) -> {ok, #state{}}.
-%% @private
-code_change(_OldVsn, State, _Extra) ->
-  {ok, State}.
-
-
--spec handle_send(reference(), binary(), #state{}) ->
-                   {reply, ok | {error, not_found}, #state{}} |
-                   {stop, file:posix(), {error, file:posix()}, #state{}}.
 handle_send(Ref, Data, State) ->
   case lookup(Ref, State) of
-    [{Ref, ReqId}] ->
-      case send({fcgi_stdin, ReqId, Data}, State) of
-        {ok, NewState} ->
-          {reply, ok, NewState};
-        Error = {error, Reason} ->
-          {stop, Reason, Error, State} end;
-    [] -> {reply, {error, not_found}, State} end.
+    [{Ref, ReqId}] -> send({fcgi_stdin, ReqId, Data}, State);
+    [] -> State end.
 
 -spec send_packet_msg(ex_fcgi_protocol:packet(),
-                      reference(), pid(), #state{}) -> ok.
-send_packet_msg({fcgi_end_request, _ReqId, Status, AppStatus},
-                Ref, Pid, State) ->
+                      {req_id(), Ref::reference(), Timer::reference(), pid(),
+                       MonitorRef::reference()}, #state{}) -> #state{}.
+send_packet_msg({fcgi_end_request, ReqId, Status, AppStatus},
+                {_ReqId, Ref, Timer, Pid, MonitorRef}, State) ->
   Pid ! {fcgi_end_request, Ref, Status, AppStatus},
-  _ = delete(Ref, State),
-  ok;
-send_packet_msg({fcgi_stdout, _ReqId, Data}, Ref, Pid, _State) ->
+  _ = erlang:cancel_timer(Timer),
+  erlang:demonitor(MonitorRef),
+  delete_monitor(MonitorRef, State),
+  delete(Ref, State),
+  delete(ReqId, State),
+  State;
+send_packet_msg({fcgi_stdout, _ReqId, Data},
+                {_ReqId, Ref, _Timer, Pid, _MonitorRef}, State) ->
   Pid ! {fcgi_stdout, Ref, stream_body(Data)},
-  ok;
-send_packet_msg({fcgi_stderr, _ReqId, Data}, Ref, Pid, _State) ->
+  State;
+send_packet_msg({fcgi_stderr, _ReqId, Data},
+                {_ReqId, Ref, _Timer, Pid, _MonitorRef}, State) ->
   Pid ! {fcgi_stderr, Ref, stream_body(Data)},
-  ok;
-send_packet_msg({fcgi_data, _ReqId, Data}, Ref, Pid, _State) ->
+  State;
+send_packet_msg({fcgi_data, _ReqId, Data},
+                {_ReqId, Ref, _Timer, Pid, _MonitorRef}, State) ->
   Pid ! {fcgi_data, Ref, stream_body(Data)},
-  ok.
+  State.
 
 -spec stream_body(binary()) -> binary() | eof.
 stream_body(<<>>) ->
@@ -216,68 +198,66 @@ stream_body(Bin) ->
   Bin.
 
 
--spec do_abort(reference(), #state{}) -> ok.
-do_abort(Ref, State) ->
-  case delete(Ref, State) of
-    {deleted, ReqId} -> send({fcgi_abort_request, ReqId}, State);
-    not_found -> ok end.
+-spec do_abort(req_id(), #state{}) -> #state{}.
+do_abort(ReqId, State) ->
+  send({fcgi_abort_request, ReqId}, State).
 
 
 -spec initial_state(address(), port_number()) -> #state{}.
 initial_state(Address, Port) ->
-  #state{address = Address, port = Port, table = ets:new(?MODULE, [private])}.
+  #state{address = Address, port = Port,
+         requests = ets:new(requests, [private]),
+         monitors = ets:new(monitors, [private])}.
 
 -spec next_req_id(#state{}) -> {req_id(), #state{}}.
 next_req_id(State = #state{next_id = ReqId}) ->
   {ReqId, State#state{next_id = ReqId + 1 rem 65535}}.
 
--spec send_packets([ex_fcgi_protocol:packet()], #state{}) ->
-                    {ok, #state{socket :: inet:socket()}} |
-                    {error, file:posix()}.
+-spec send_packets([ex_fcgi_protocol:packet()], #state{}) -> #state{}.
 send_packets(Packets, State = #state{socket = undefined}) ->
-  case open_socket(State) of
-    {ok, NewState} -> send_packets(Packets, NewState);
-    Error -> Error end;
+  send_packets(Packets, open_socket(State));
 send_packets(Packets, State = #state{socket = Socket}) ->
-  case gen_tcp:send(Socket, [ ex_fcgi_protocol:encode(P) || P <- Packets ]) of
-    ok -> {ok, State};
-    Error -> Error end.
+  ok = gen_tcp:send(Socket, [ ex_fcgi_protocol:encode(P) || P <- Packets ]),
+  State.
 
--spec send(ex_fcgi_protocol:packet(), #state{}) ->
-            {ok, #state{socket :: inet:socket()}} | {error, file:posix()}.
+-spec send(ex_fcgi_protocol:packet(), #state{}) -> #state{}.
 send(Packet, State = #state{socket = undefined}) ->
-  case open_socket(State) of
-    {ok, NewState} -> send(Packet, NewState);
-    Error -> Error end;
+  send(Packet, open_socket(State));
 send(Packet, State = #state{socket = Socket}) ->
-  case gen_tcp:send(Socket, ex_fcgi_protocol:encode(Packet)) of
-    ok -> {ok, State};
-    Error -> Error end.
+  ok = gen_tcp:send(Socket, ex_fcgi_protocol:encode(Packet)),
+  State.
 
 -spec open_socket(#state{socket :: undefined}) ->
-                   {ok, #state{socket :: inet:socket()}} |
-                   {error, file:posix()}.
+                  #state{socket :: inet:socket()}.
 open_socket(State = #state{socket = undefined,
                            address = Address,
                            port = Port}) ->
-  case gen_tcp:connect(Address, Port, [binary, {packet, fcgi}]) of
-    {ok, Socket} -> {ok, State#state{socket = Socket}};
-    Error -> Error end.
+  {ok, Socket} = gen_tcp:connect(Address, Port, [binary, {packet, fcgi}]),
+  State#state{socket = Socket}.
 
--spec insert({req_id(), reference(), pid()}, #state{}) -> true.
-insert(Req = {ReqId, Ref, _Pid}, #state{table = Tid}) ->
-  true = ets:insert_new(Tid, [Req, {Ref, ReqId}]).
-
--spec delete(reference(), #state{}) -> {deleted, req_id()} | not_found.
-delete(Ref, State = #state{table = Tid}) ->
-  case lookup(Ref, State) of
-    [{Ref, ReqId}] ->
-      ets:delete(Tid, Ref),
-      ets:delete(Tid, ReqId),
-      {deleted, ReqId};
-    [] -> not_found end.
+-spec insert({req_id(), Ref::reference(), Timer::reference(), pid(),
+              MonitorRef::reference()}, #state{}) -> true.
+insert(Req = {ReqId, Ref, _Timer, _Pid, MonitorRef},
+       #state{requests = Requests, monitors = Monitors}) ->
+  true = ets:insert_new(Requests, [Req, {Ref, ReqId}]),
+  true = ets:insert_new(Monitors, [{MonitorRef, Ref}]).
 
 -spec lookup(reference(), #state{}) -> [{reference(), req_id()}];
-            (req_id(), #state{}) -> [{req_id(), reference(), pid()}].
-lookup(Key, #state{table = Tid}) ->
-  ets:lookup(Tid, Key).
+            (req_id(), #state{}) ->
+              [{req_id(), Ref::reference(), Timer::reference(), pid(),
+               MonitorRef::reference()}].
+lookup(Key, #state{requests = Requests}) ->
+  ets:lookup(Requests, Key).
+
+-spec delete(reference() | req_id(), #state{}) -> true.
+delete(Key, #state{requests = Requests}) ->
+  ets:delete(Requests, Key).
+
+-spec lookup_monitor(reference(), #state{}) ->
+                      [{MonitorRef::reference(), Ref::reference()}].
+lookup_monitor(MonitorRef, #state{monitors = Monitors}) ->
+  ets:lookup(Monitors, MonitorRef).
+
+-spec delete_monitor(reference(), #state{}) -> true.
+delete_monitor(MonitorRef, #state{monitors = Monitors}) ->
+  ets:delete(Monitors, MonitorRef).
