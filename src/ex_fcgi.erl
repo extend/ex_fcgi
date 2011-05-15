@@ -88,10 +88,13 @@ disconnect(Server) ->
 -spec begin_request(server(), role(), [param()], uint32()) -> {ok, reference()}.
 %% @doc Make a FastCGI request.
 begin_request(Server, Role, Params, Timeout) ->
-  Ref = make_ref(),
-  Timer = erlang:send_after(Timeout, self(), {ex_fcgi_timeout, Ref}),
-  Server ! {ex_fcgi_begin_request, Ref, Timer, self(), Role, Params},
-  {ok, Ref}.
+  case ex_fcgi_protocol:encode_params(Params) of
+    error -> error;
+    EncodedParams ->
+      Ref = make_ref(),
+      Timer = erlang:send_after(Timeout, self(), {ex_fcgi_timeout, Ref}),
+      Server ! {ex_fcgi_begin_request, Ref, Timer, self(), Role, EncodedParams},
+      {ok, Ref} end.
 
 -spec abort_request(server(), reference()) -> ok.
 %% @doc Abort a FastCGI request.
@@ -161,12 +164,11 @@ format_status(_Opt, [_PDict, _SysState, _Parent, _Debug,
                       {current_reqs_count, ets:info(Monitors, size)}]}]}].
 
 -spec handle_msg(term(), #state{}) -> #state{}.
-handle_msg({ex_fcgi_begin_request, Ref, Timer, Pid, Role, Params}, State) ->
+handle_msg({ex_fcgi_begin_request, Ref, Timer, Pid, Role, EncParams}, State) ->
   {ReqId, State1} = next_req_id(State),
-  State2 = send_packets([{fcgi_begin_request, ReqId, Role, keepalive},
-                         {fcgi_params, ReqId,
-                          ex_fcgi_protocol:encode_params(Params)},
-                         {fcgi_params, ReqId, <<>>}], State1),
+  ParamsPackets = [ {fcgi_params, ReqId, Packet} || Packet <- EncParams ],
+  Request = [{fcgi_begin_request, ReqId, Role, keepalive} | ParamsPackets],
+  State2 = send_packets(Request, State1),
   MonitorRef = erlang:monitor(process, Pid),
   insert({ReqId, Ref, Timer, Pid, MonitorRef}, State2),
   State2;

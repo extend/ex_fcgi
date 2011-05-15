@@ -114,29 +114,61 @@ encode({fcgi_get_values_result, ReqId, Data}) ->
 encode({fcgi_unknown_type, ReqId}) ->
   wrap(?FCGI_UNKNOWN_TYPE, ReqId, <<>>).
 
-
--spec encode_params([ex_fcgi:param()]) -> iolist().
+-spec encode_params([ex_fcgi:param()]) -> [iolist()] | error.
 encode_params(Params) ->
-  encode_params(Params, []).
+  encode_params(Params, [<<>>], [], 0, []).
 
--spec encode_params([ex_fcgi:param()], iolist()) -> iolist().
-%% @todo check keys
-%% @todo check length
-encode_params([{Key, Value} | Params], Acc) ->
-  NewAcc = case {iolist_size(Key), iolist_size(Value)} of
-             {KLen, VLen} when KLen =< 127, VLen =< 127 ->
-               [[<<0:1, KLen:7, 0:1, VLen:7>>, Key, Value] | Acc];
-             {KLen, VLen} when KLen =< 127, VLen =< (1 bsl 31) - 1 ->
-               [[<<0:1, KLen:7, 1:1, VLen:31>>, Key, Value] | Acc];
-             {KLen, VLen} when KLen =< (1 bsl 31) - 1, VLen =< 127 ->
-               [[<<1:1, KLen:31, 0:1, VLen:7>>, Key, Value] | Acc];
-             {KLen, VLen} when KLen =< (1 bsl 31) - 1, VLen =< 127 ->
-               [[<<1:1, KLen:31, 1:1, VLen:31>>, Key, Value] | Acc] end,
-  encode_params(Params, NewAcc);
-encode_params([], Acc) ->
-  % reverse?
-  Acc.
+-spec encode_params([ex_fcgi:param() | {encoded, ex_fcgi:short(), iolist()}],
+                    [iodata()], [iodata()], ex_fcgi:short(),
+                    [{encoded, ex_fcgi:short(), iolist()}]) ->
+                      [iodata()] | error.
+encode_params([P = {_N, _V} | Ps], Packets, Acc, L, Skipped) ->
+  E = {encoded, Size, _IoList} = encode_param(P),
+  case Size > 65535 of
+    true ->
+      % The param is too big to be put in a single FastCGI packet; as no
+      % known implementation supports the params-as-stream feature, this is
+      % considered an error.
+      error;
+    false ->
+      encode_params(Ps, Packets, Acc, L, Skipped, E) end;
+encode_params([E | Ps], Packets, Acc, L, Skipped) ->
+  encode_params(Ps, Packets, Acc, L, Skipped, E);
+encode_params([], Packets, Acc, _L, []) ->
+  [Acc|Packets];
+encode_params([], _Packets, [], 0, _Skipped) ->
+  error;
+encode_params([], Packets, Acc, _L, Skipped) ->
+  encode_params(Skipped, [Acc|Packets], [], 0, []).
 
+-spec encode_params([ex_fcgi:param() | {encoded, ex_fcgi:short(), iolist()}],
+                    [iodata()], [iodata()], ex_fcgi:short(),
+                    [{encoded, ex_fcgi:short(), iolist()}],
+                    {encoded, non_neg_integer(), iolist()}) ->
+                      [iodata()] | error.
+encode_params(Rest, Packets, Acc, L, Skipped, E = {encoded, Size, IoList}) ->
+  NewLength = Size + L,
+  case NewLength > 65535 of
+    true ->
+      % This param is too big to be put in the remaining space of the
+      % current FastCGI packet; put its encoded form in the skipped stack.
+      encode_params(Rest, Packets, Acc, L, [E | Skipped]);
+    false ->
+      encode_params(Rest, Packets, [IoList | Acc], NewLength, Skipped) end.
+
+-spec encode_param(ex_fcgi:param()) -> {encoded, non_neg_integer(), iolist()}.
+encode_param({N, V}) ->
+  NLen = iolist_size(N),
+  VLen = iolist_size(V),
+  Size = NLen + VLen,
+  if NLen =< 127, VLen =< 127 ->
+       {encoded, Size + 2, [<<0:1, NLen:7, 0:1, VLen:7>>, N, V]};
+     NLen =< 127 ->
+       {encoded, Size + 5, [<<0:1, NLen:7, 1:1, VLen:31>>, N, V]};
+     VLen =< 127 ->
+       {encoded, Size + 5, [<<1:1, NLen:31, 0:1, VLen:7>>, N, V]};
+     true ->
+       {encoded, Size + 8, [<<1:1, NLen:31, 1:1, VLen:31>>, N, V]} end.
 
 -spec wrap(packet_type(), ex_fcgi:req_id(), iodata()) -> iolist().
 wrap(Type, ReqId, Content) ->
