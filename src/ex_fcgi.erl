@@ -190,7 +190,7 @@ handle_msg({ex_fcgi_abort_request, Ref}, State) ->
 handle_msg({tcp, Socket, Data},
            State = #state{socket = Socket, buffer = Buffer}) ->
   State#state{buffer = handle_data(<<Buffer/binary, Data/binary>>, State)};
-handle_msg({'EXIT', MonitorRef, process, _Pid, _Reason}, State) ->
+handle_msg({'DOWN', MonitorRef, process, _Pid, _Reason}, State) ->
   case lookup_monitor(MonitorRef, State) of
     [{_MonitorRef, Ref}] ->
       delete_monitor(MonitorRef, State),
