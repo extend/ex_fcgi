@@ -134,10 +134,10 @@ encode_params([P = {_N, _V} | Ps], Packets, Acc, L, Skipped) ->
       encode_params(Ps, Packets, Acc, L, Skipped, E) end;
 encode_params([E | Ps], Packets, Acc, L, Skipped) ->
   encode_params(Ps, Packets, Acc, L, Skipped, E);
-encode_params([], Packets, Acc, _L, []) ->
-  [Acc|Packets];
 encode_params([], _Packets, [], 0, _Skipped) ->
   error;
+encode_params([], Packets, Acc, _L, []) ->
+  [Acc|Packets];
 encode_params([], Packets, Acc, _L, Skipped) ->
   encode_params(Skipped, [Acc|Packets], [], 0, []).
 

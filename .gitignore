@@ -1,2 +1,4 @@
 /doc/
 /ebin/
+/logs/
+/test/*.beam
