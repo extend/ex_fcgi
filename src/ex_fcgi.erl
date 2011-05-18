@@ -46,8 +46,8 @@
               key/0, value/0, param/0, server/0]).
 
 
--export([connect/3,
-         disconnect/1,
+-export([start/3,
+         stop/1,
          begin_request/4,
          send/3,
          abort_request/2,
@@ -70,20 +70,15 @@
                 buffer = <<>> :: binary()}).
 
 
--spec connect(atom(), address(), port_number()) -> {ok, pid()}.
+-spec start(atom(), address(), port_number()) -> {ok, pid()}.
 %% @doc Connect to a FastCGI server.
-connect(Name, Address, Port) ->
-  ChildSpec = {Name,
-               {ex_fcgi, start_link, [Name, Address, Port]},
-               permanent, 5000, worker, [ex_fcgi]},
-  supervisor:start_child(ex_fcgi_sup, ChildSpec).
+start(Name, Address, Port) ->
+  ex_fcgi_sup:start_child(Name, Address, Port).
 
--spec disconnect(server()) -> ok.
+-spec stop(atom()) -> ok.
 %% Close a connection to a FastCGI server.
-disconnect(Server) ->
-  case supervisor:terminate_child(ex_fcgi_sup, Server) of
-    ok -> supervisor:delete_child(ex_fcgi_sup, Server);
-    Error -> Error end.
+stop(Name) ->
+  ex_fcgi_sup:stop_child(Name).
 
 -spec begin_request(server(), role(), [param()], uint32()) -> {ok, reference()}.
 %% @doc Make a FastCGI request.

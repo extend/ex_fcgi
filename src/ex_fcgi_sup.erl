@@ -19,10 +19,26 @@
 -author('Anthony Ramine <nox@dev.extend.eu>').
 -behaviour(supervisor).
 
+-export([start_child/3,
+         stop_child/1]).
 
 -export([start_link/0,
          init/1]).
 
+
+-spec start_child(atom(), ex_fcgi:address(), ex_fcgi:port_number()) ->
+                   {ok, pid()} | {error, term()}.
+start_child(Name, Address, Port) ->
+  ChildSpec = {Name,
+               {ex_fcgi, start_link, [Name, Address, Port]},
+               permanent, 5000, worker, [ex_fcgi]},
+  supervisor:start_child(?MODULE, ChildSpec).
+
+-spec stop_child(atom()) -> ok | {error, term()}.
+stop_child(Name) ->
+  case supervisor:terminate_child(?MODULE, Name) of
+    ok -> supervisor:delete_child(?MODULE, Name);
+    Error -> Error end.
 
 -spec start_link() -> {ok, pid()}.
 start_link() ->
