@@ -25,12 +25,13 @@
          simple_request/1,
          multiplex/1,
          unknown_packet/1,
-         abort_request/1]).
+         abort_request/1,
+         send/1]).
 
 
 all() ->
   [big_param, simple_request, timeout, multiplex, unknown_packet,
-   abort_request].
+   abort_request, send].
 
 init_per_suite(Config) ->
   application:start(ex_fcgi),
@@ -217,6 +218,47 @@ abort_request(_Config) ->
           exit(got_timeout)
       after 600 ->
         ok end
+    after
+      gen_tcp:close(Socket) end
+  after
+    ex_fcgi:stop(fcgi),
+    gen_tcp:close(LSocket) end.
+
+send(_Config) ->
+  Options = [binary, {active, false}, {reuseaddr, true}],
+  {ok, LSocket} = gen_tcp:listen(33000, Options),
+  {ok, _Pid} = ex_fcgi:start(fcgi, localhost, 33000),
+  try
+    Params = [{<<"P">>, <<"">>}],
+    {ok, Ref} = ex_fcgi:begin_request(fcgi, responder, Params, 500),
+    {ok, Socket} = gen_tcp:accept(LSocket, 500),
+    try
+      ex_fcgi:send(fcgi, Ref, <<"Request body.">>),
+      ex_fcgi:end_request(fcgi, Ref),
+      {ok, Data} = gen_tcp:recv(Socket, 64, 500),
+      <<% {begin_request, ReqId, responder, [keepalive]}
+        1, ?FCGI_BEGIN_REQUEST, ReqId:16, 8:16, 0, _, ?FCGI_RESPONDER:16,
+        ?FCGI_KEEP_CONN, _:40,
+        % {params, ReqId, [<<"P">>, <<"">>]}
+        1, ?FCGI_PARAMS, ReqId:16, 3:16, 0, _,
+        0:1, 1:7, 0:1, 0:7, "P", "",
+        % {params, ReqId, eof}
+        1, ?FCGI_PARAMS, ReqId:16, 0:16, 0, _,
+        % {stdin, ReqId, <<"Request body.">>}
+        1, ?FCGI_STDIN, ReqId:16, 13:16, 0, _, "Request body.",
+        %, {stdin, ReqId, <<>>}
+        1, ?FCGI_STDIN, ReqId:16, 0:16, 0, _>> = Data,
+      Reply = <<% {end_request, ReqId, request_complete, 0}
+                1, ?FCGI_END_REQUEST, ReqId:16, 8:16, 0, 0,
+                0:32, ?FCGI_REQUEST_COMPLETE, 0:24>>,
+      ok = gen_tcp:send(Socket, Reply),
+      receive
+        {ex_fcgi, Ref, Messages} ->
+          [{end_request, request_complete, 0}] = Messages;
+        {ex_fcgi_timeout, Ref} ->
+          exit(got_timeout)
+      after 2000 ->
+        exit(got_nothing) end
     after
       gen_tcp:close(Socket) end
   after
