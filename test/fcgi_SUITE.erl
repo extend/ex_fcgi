@@ -28,12 +28,13 @@
          abort_request/1,
          send/1,
          kill/1,
-         stream/1]).
+         stream/1,
+         close/1]).
 
 
 all() ->
   [big_param, simple_request, timeout, multiplex, unknown_packet,
-   abort_request, send, kill, stream].
+   abort_request, send, kill, stream, close].
 
 init_per_suite(Config) ->
   application:start(ex_fcgi),
@@ -351,6 +352,38 @@ stream(_Config) ->
           exit(got_timeout_1)
       after 2000 ->
         exit(got_nothing_1) end
+    after
+      gen_tcp:close(Socket) end
+  after
+    ex_fcgi:stop(fcgi),
+    gen_tcp:close(LSocket) end.
+
+close(_Config) ->
+  Options = [binary, {active, false}, {reuseaddr, true}],
+  {ok, LSocket} = gen_tcp:listen(33000, Options),
+  {ok, _Pid} = ex_fcgi:start(fcgi, localhost, 33000),
+  try
+    Params = [{<<"P">>, <<"">>}],
+    {ok, Ref} = ex_fcgi:begin_request(fcgi, responder, Params, 500),
+    {ok, Socket} = gen_tcp:accept(LSocket, 500),
+    try
+      {ok, Data} = gen_tcp:recv(Socket, 35, 500),
+      <<% {begin_request, ReqId, responder, [keepalive]}
+        1, ?FCGI_BEGIN_REQUEST, ReqId:16, 8:16, 0, _, ?FCGI_RESPONDER:16,
+        ?FCGI_KEEP_CONN, _:40,
+        % {params, ReqId, [<<"P">>, <<"">>]}
+        1, ?FCGI_PARAMS, ReqId:16, 3:16, 0, _,
+        0:1, 1:7, 0:1, 0:7, "P", "",
+        % {params, ReqId, eof}
+        1, ?FCGI_PARAMS, ReqId:16, 0:16, 0, _>> = Data,
+      gen_tcp:close(Socket),
+      receive
+        {ex_fcgi, Ref, _Messages} ->
+          exit(got_messages);
+        {ex_fcgi_timeout, Ref} ->
+          ok
+      after 600 ->
+        exit(got_nothing) end
     after
       gen_tcp:close(Socket) end
   after
