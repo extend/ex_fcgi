@@ -195,7 +195,9 @@ handle_msg({'DOWN', MonitorRef, process, _Pid, _Reason}, State) ->
       do_abort(ReqId, State);
     [] -> State end;
 handle_msg({tcp_closed, Socket}, State = #state{socket = Socket}) ->
-  State#state{socket = undefined};
+  handle_socket_error(State);
+handle_msg({tcp_error, Socket, _Reason}, State = #state{socket = Socket}) ->
+  handle_socket_error(State);
 handle_msg({system, From, Msg}, State = #state{parent = Parent}) ->
   sys:handle_system_msg(Msg, From, Parent, ?MODULE, [], State);
 handle_msg(_Msg, State) ->
@@ -270,6 +272,15 @@ stream_body(<<>>) ->
   eof;
 stream_body(Bin) ->
   Bin.
+
+-spec handle_socket_error(#state{socket :: inet:socket()}) ->
+                           #state{socket :: undefined}.
+handle_socket_error(State = #state{requests = Requests, monitors = Monitors}) ->
+  ets:delete_all_objects(Requests),
+  lists:foreach(fun ({MonitorRef, _Ref}) -> erlang:demonitor(MonitorRef) end,
+                ets:tab2list(Monitors)),
+  ets:delete_all_objects(Monitors),
+  State#state{socket = undefined}.
 
 
 -spec do_abort(req_id(), #state{}) -> #state{}.
