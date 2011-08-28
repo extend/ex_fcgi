@@ -114,8 +114,7 @@ end_request(Server, Ref) ->
 %% @doc Start a new FastCGI client.
 %% @private
 start_link(Name, Address, Port) ->
-  Pid = proc_lib:spawn_link(?MODULE, init, [Name, self(), Address, Port]),
-  {ok, Pid}.
+  proc_lib:start_link(?MODULE, init, [Name, self(), Address, Port]).
 
 
 -spec init(atom(), pid(), address(), port_number()) -> no_return().
@@ -123,6 +122,7 @@ start_link(Name, Address, Port) ->
 init(Name, Parent, Address, Port) ->
   State = initial_state(Parent, Address, Port),
   register(Name, self()),
+  proc_lib:init_ack(Parent, {ok, self()}),
   receive_loop(State).
 
 -spec receive_loop(#state{}) -> no_return().
