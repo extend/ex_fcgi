@@ -15,7 +15,7 @@
 
 {application, ex_fcgi,
  [{description, "A FastCGI client"},
-  {vsn, "1"},
+  {vsn, "1.0.0"},
   {registered, [ex_fcgi_sup]},
   {applications, [kernel,
                   stdlib]},
