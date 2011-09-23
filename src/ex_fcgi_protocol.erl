@@ -86,7 +86,7 @@ decode(Data, ?FCGI_GET_VALUES, ReqId) ->
 decode(Data, ?FCGI_GET_VALUES_RESULT, ReqId) ->
   {fcgi_get_values_result, ReqId, Data}.
 
--spec encode(ex_fcgi:packet()) -> iolist().
+-spec encode(packet()) -> iolist().
 %% Encode a FastCGI packet.
 encode({fcgi_begin_request, ReqId, Role, ConnectionMode}) ->
   RoleInt = role_to_int(Role),
