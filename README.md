@@ -1,6 +1,8 @@
 ex_fcgi
 =======
 
+NOTE: This repository is no longer being updated. For continued development see [unix1/ex_fcgi](https://github.com/unix1/ex_fcgi).
+
 ex_fcgi is a straightforward [FastCGI](http://www.fastcgi.com/) client written
 in Erlang.
 
